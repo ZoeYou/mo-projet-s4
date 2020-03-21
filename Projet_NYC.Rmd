@@ -38,6 +38,9 @@ library(PerformanceAnalytics)
 library(rpart)
 library(rpart.plot)
 library(knitr)
+library(NbClust)
+library(mclust)
+library(geosphere)
 ```
 
 ```{r}
@@ -146,28 +149,94 @@ trip_duration: the target characteristic in the training data is measured in sec
 summary(train$trip_duration)
 ```
 
-* Note that the *trip_duration* variable has a minimum of 1 second and a maximum of 3,526,282 seconds (approximately 980 hours). It is impossible for someone to make such a long trip. And a trip of a second goes nowhere.
-It is therefore clear that there are some outliers associated with the `trip_duration` variable. We will exclude data that lies outside two standard deviations from the mean for example.                   
+Well it seems there were trips lasted a long time like about 3000000 seconds, we arranged the data in descending order of trip-duration:
 
 ```{r}
-m <-  mean(train$trip_duration)
-s <-  sd(train$trip_duration)
-train <-  filter(train, trip_duration <= m + 2*s)
-train <-  filter(train, trip_duration >= 60)
-summary(train$trip_duration)
+train[,which(colnames(train)%in%c("pickup_datetime","pickup_longitude","pickup_latitude","dropoff_longitude","dropoff_latitude","trip_duration"))] %>% 
+  arrange(desc(trip_duration)) %>%
+  head(7)
 ```
-Let's plot a simple histogram of the trip duration, throwing the data into 100 bins. :
+
+And we can see that there are only four trips wich such a long duration and they don't offer us with so much information. So we decided that these values should be removed from the training data set for continued exploration and modelling.
 
 ```{r}
-train %>%
+train <- filter(train, trip_duration < 1000000)
+```
+
+
+Then we wanted to see the distribution of data with trip_duratin more than 80000(about 24 hours):
+
+```{r}
+long_trip <- filter(train, trip_duration >= 80000)
+long_trip %>%
   ggplot(aes(trip_duration)) +
   geom_histogram(fill = "#96A6F0", color ="white", bins = 100) 
 ```
 
+Here we found something very interesting, because it's actually the trip_duration in the tail of distribution which have a higher frequency. It infers that long journeys are not exceptions. 
+
+Here we define day-long trips as taking between 22 and 24 hours, which covers a small peak in our raw trip_duration distribution.
+
+```{r}
+ny_map <- as.tibble(map_data("state", region = "new york:manhattan"))
+
+set.seed(2017)
+long_trip <- long_trip %>%
+  sample_n(200)
+
+tpick <- long_trip %>%
+  dplyr::select(lon = pickup_longitude, lat = pickup_latitude)
+tdrop <- long_trip %>%
+  dplyr::select(lon = dropoff_longitude, lat = dropoff_latitude)
+
+p1 <- ggplot() +
+  geom_polygon(data=ny_map, aes(x=long, y=lat), fill = "grey60") +
+  geom_point(data=tpick,aes(x=lon,y=lat),size=1,color='red',alpha=1) +
+  geom_point(data=tdrop,aes(x=lon,y=lat),size=1,color='blue',alpha=1)
+
+for (i in seq(1,nrow(tpick))){
+  inter <- as.tibble(gcIntermediate(tpick[i,],  tdrop[i,], n=30, addStartEnd=TRUE))
+  p1 <- p1 +  geom_line(data=inter,aes(x=lon,y=lat),color='blue',alpha=.25)
+}
+
+p1 + ggtitle("Day-long trips in relation to Manhattan")
+```
+
+Here we are plotting only 200 of the about 1800 connections to keep the map reasonably readable and the script fast. Pickup points are red and dropoff points are blue.
+
+* We find:
+  -  A few longer distances stand out, but they are exceptions. The two major group of trips are those within Manhattan and those between Manhattan and the airports. 
+  - There is little to suggest that these extreme trip_durations were real.
+  - There is another insight here which is rather intuitive: trips to or from any of the airports (most prominently JFK) are unlikely to be very short. Thus, the a close distance of either pickup or dropoff to the airport could be a valuable predictor for longer trip_duration. This is something that we took from here to the feature engineering.
+
+Decision: We will remove trip_durations longer than 22 hours from the exploration and possibly from the modelling.
+
+
+
+
+```{r}
+# m <-  mean(train$trip_duration)
+# s <-  sd(train$trip_duration)
+short_trip <- filter(train, trip_duration <= 80000)
+short_trip <- filter(short_trip, trip_duration >= 60)
+# summary(train$trip_duration)
+```
+
+Let's plot a simple histogram of the trip duration, throwing the data into 100 bins. :
+
+```{r}
+short_trip %>%
+  ggplot(aes(trip_duration)) +
+  geom_histogram(fill = "#96A6F0", color ="white", bins = 100) 
+```
+
+
+It is therefore clear that there are some outliers associated with the `trip_duration` variable. We will exclude data that which trip_duration is less than 60 seconds or longer than 20 hours.                   
+
 We apply some data transformations, for example, applying a log transformation to the trip duration:
 
 ```{r}
-train %>%
+short_trip %>%
   ggplot(aes(trip_duration)) +
   geom_histogram(fill = "#96A6F0", color ="white", bins = 100) +
   scale_x_log10() +
@@ -187,81 +256,6 @@ sum(!int_length(interval(train$pickup_datetime,train$dropoff_datetime))==train$t
 ```
 
 We find that all the subtraction of pickup_datetime and the its corresponding drop_datetime equal well to their trip_duration. So, everything fits perfectly.
-
-### Pickup_time and trip_duration (w.r.t. vendor_id)
-
-Do quieter days and hours lead to faster trips? Here we include the vendor_id as an additional feature. Furthermore, for the hours of the day we add a smoothing layer to indicate the extent of the variation and its uncertainties:
-
-```{r}
-p1 <- train %>%
-  mutate(wday = factor(wday(pickup_datetime, label = TRUE))) %>%
-  group_by(wday, vendor_id) %>%
-  dplyr::summarise(median_duration = median(trip_duration)/60) %>%
-  ggplot() +
-    aes(x=wday, y=median_duration, color = as.factor(vendor_id)) +
-    geom_smooth(method = "loess", span = 1/2) +
-    geom_point(size = 4) +
-    scale_color_hue() +
-    labs(x = "Day of the week", y = "Median trip duration [min]")
-plot(p1)
-```
-
-```{r}
-p2 <- train %>%
-  mutate(hpick = hour(pickup_datetime)) %>%
-  dplyr::group_by(hpick, vendor_id) %>%
-  dplyr::summarise(median_duration = median(trip_duration)/60) %>%
-  ggplot()+
-    aes(x= hpick, y=median_duration, color = as.factor(vendor_id)) +
-    geom_smooth(method = "loess", span = 1/2) +
-    geom_point(size = 4) +
-    #geom_text(show.legend = FALSE)+
-    scale_color_hue() +
-    labs(x = "Hour of the day", y = "Median trip duration [min]") 
-    #theme(legend.position = "none")
-plot(p2)
-```
-
-The two figures represent how the day and the week affect the average trip duration (Here we include the vendor_id as an additional feature.). 
-We can find a peak in the early afternoon and dips around 5-6am and 8pm. 
-The Vendor 2, the one with the more frequent trips, also has consistently higher trip durations than vendor 1. 
-
-**Conclusion :**
-The **vendor_id, the weekday and hour of a trip** appear to be important features for predicting its duration and should be included in the model.
-
-### Passenger count and Trip Duration (w.r.t. vendor_id)
-
-```{r}
-train %>%
-  ggplot() +
-  aes(passenger_count, trip_duration, color = passenger_count) +
-  geom_boxplot() +
-  scale_y_log10() +
-  theme(legend.position = "none") +
-  facet_wrap(~ vendor_id) +
-  labs(y = "Trip duration [s]", x = "Number of passengers")
-```
-
-The figure represent how the number of passengers affect the duration of the trip. (Here we include the vendor_id as an additional feature).
-We finf that
-* Both vendors have short trips without any passengers.
-* Vendor 1 has all of the trips beyond 24 hours, whereas vendor 2 has all of the (five) trips with more than six passengers and many more trips that approach the 24-hour limit.
-* Between 1 and 6 passengers the median trip durations are remarkably similar, in particular for vendor 2.
-
-```{r}
-train %>%
-  ggplot(aes(trip_duration, fill = vendor_id)) +
-  geom_density(position = "stack") +
-  scale_x_log10()
-```
-
-Comparing the densities of the trip_duration distribution for the two vendors we find that the medians are very similar, whereas the means are likely skewed by vendor 2 containing most of the long-duration outliers:
-```{r}
-train %>%
-  group_by(vendor_id) %>%
-  summarise(mean_duration = mean(trip_duration),
-            median_duration = median(trip_duration))
-```
 
 ## Analysis of datetime
 
@@ -341,10 +335,11 @@ The two figures represent the frequency corresponding to the hour of a day, one 
 Since different rides from different months, weekdays and hours of day have shown some specific trends, we have reason to believe that these information could be extracted as some variables, here we introduce three new categorical varibles represent respectively the month, weekday and the hour of one ride:   
 
 ```{r}
-train$pickup_hour <-  hour(train$pickup_datetime)
-train$pickup_month <-  month(train$pickup_datetime)
-train$pickup_wday <-  wday(train$pickup_datetime)
+train$pickup_hour <- as.factor(hour(train$pickup_datetime))
+train$pickup_month <- as.factor(month(train$pickup_datetime))
+train$pickup_wday <- as.factor(wday(train$pickup_datetime))
 ```
+
 
 ## Analysis of coordinates
 ```{r}
@@ -405,31 +400,14 @@ distance <- function(lat1, lat2, lng1, lng2)
   b = haversine(lat1, lat2, lng1, lng1)
   return (a+b)
 }
-
-direction <- function(lat1, lat2, lng1, lng2)
-{
-  r <- 6371 # Average Earth Radius
-  lat1 <- deg2rad(lat1)
-  lat2 <- deg2rad(lat2)
-  lng1 <- deg2rad(lng1)
-  lng2 <- deg2rad(lng2)
-  d_lng <- lng2 - lng1
-  x <- cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(d_lng)
-  y <- sin(d_lng) * cos(lat2)
-  return (rad2deg(atan2(y, x)))
-}
 ```
 
-We will use the previous functions to calculate the distances(in kilometers) and the directions(in degres), which we will store in the train and test tables.
+We will use the previous functions to calculate the distances(in kilometers) which we will store in the train and test tables.
 
 ```{r}
 train$distance <- distance(train$pickup_latitude, train$dropoff_latitude, train$pickup_longitude, train$dropoff_longitude)
 
 test$distance <- distance(test$pickup_latitude, test$dropoff_latitude, test$pickup_longitude, test$dropoff_longitude)
-
-train$direction <- direction(train$pickup_latitude, train$dropoff_latitude, train$pickup_longitude, train$dropoff_longitude)
-
-test$direction <- direction(test$pickup_latitude, test$dropoff_latitude, test$pickup_longitude, test$dropoff_longitude)
 ```
 
 ### Analysis of Distance
@@ -462,7 +440,21 @@ train %>%
   ylab('number of train records')
 ```
 
-After looking at the distribution of log (distance), we found that its head and middle are well in line with the trend of normal distribution, but there are several peaks in the data set at the tail, which requires us to do some further exploration. 
+After looking at the distribution of log (distance), we found that its head and middle are well in line with the trend of normal distribution, but there are several peaks in the data set at the tail, which requires us to do some further exploration. So we decided to do a Gaussian finite mixture modeling:
+
+```{r ajoute_par_zy_Gaussien_mixture}
+mod_gsmix <- densityMclust(log(train$distance)) 
+summary(mod_gsmix)
+
+par(mfrow=c(2,1))
+plot(mod_gsmix, what = "BIC")
+plot(mod_gsmix, what = "density", data = log(train$distance), breaks = 30)
+```
+
+```{r}
+
+```
+
 
 ### Relation between Distance and Trip Duration
 
@@ -520,38 +512,31 @@ plot(unlist(train[1:100000,8]), unlist(train[1:100000,9]), xlab="Dropoff Longitu
 
 We can see that the dropoff localisations are less 'concentrated' than the pickup locations, which means that people go from the same locations to different ones. 
 
-```{r tp_decide_k, message=FALSE, warning=FALSE}
-# k.max <- 15
-# data <- train_coord_pickup
-# wss <- sapply(1:k.max, 
-#               function(k){kmeans(data, k, nstart=50,iter.max = 15 )$tot.withinss})
-# wss
-# plot(1:k.max, wss,
-#      type="b", pch = 19, frame = FALSE, 
-#      xlab="Number of clusters K",
-#      ylab="Total within-clusters sum of squares")
+```{r to_decide_k, message=FALSE, warning=FALSE}
+train_coord_pickup <- data.frame(train$pickup_latitude, train$pickup_longitude)
+# d_clust_pickup <- Mclust(as.matrix(train_coord_pickup), G=1:15,
+#                   modelNames = mclust.options("emModelNames"))
+# plot(d_clust_pickup, what = "BIC")
+# 
+# 
+train_coord_dropoff <- data.frame(train$dropoff_latitude, train$dropoff_longitude)
+# d_clust_dropoff <- Mclust(as.matrix(train_coord_dropoff), G=1:15,
+#                   modelNames = mclust.options("emModelNames"))
+# plot(d_clust_dropoff, what = "BIC")
 ```
 
+
 ```{r}
-# nb <- NbClust(data, diss=NULL, distance = "euclidean", 
-#               min.nc=2, max.nc=5, method = "kmeans", 
-#               index = "all", alphaBeale = 0.1)
-# hist(nb$Best.nc[1,], breaks = max(na.omit(nb$Best.nc[1,])))
-# 
-# d_clust <- Mclust(as.matrix(data), G=1:15, 
-#                   modelNames = mclust.options("emModelNames"))
-# d_clust$BIC
-# plot(d_clust)
+# summary(d_clust_pickup,parameters = T)
+# summary(d_clust_dropoff,parameters = T)
 ```
 
 ```{r}
 set.seed(123)
-train_coord_pickup <- cbind(train$pickup_latitude, train$pickup_longitude)
 # Applying the Kmeans algorithm in order to create 'neighborhoods'
 nb_pickup <- kmeans(train_coord_pickup, centers=6, algorithm='Lloyd', iter.max=500 )
 
 set.seed(123)
-train_coord_dropoff <- cbind(train$dropoff_latitude, train$dropoff_longitude)
 # Applying the Kmeans algorithm in order to create 'neighborhods'
 nb_dropoff <- kmeans(train_coord_dropoff, centers=6, algorithm='Lloyd', iter.max=500 )
 
@@ -617,7 +602,7 @@ train %>%
 ```
 
 It is clear that the majority of people travel by two. 
-Also, it appears that the number of rides with six passengers are higher than the ones with four passengers. That may be due to the fact that those passengers maybe share the cost of the ride, or that there are not enough taxi cabs.   
+Also, it appears that the number of rides with six passengers are higher than the ones with four passengers. That may be due to the fact that those passengers wanted to share the cost of the ride, or that there are not enough taxi cabs.   
 
 In this section we wanted to visualize the number of passengers that travel together in each part of New York.
 
@@ -722,6 +707,81 @@ train %>%
 
 From the first histogram, we can see that the vendor 2 has the most success in general, and the second plot only confirms that. Moreover, it also appears that the vendor 2 manages more trips in *ALL* of New York City. 
 
+### Pickup_time and trip_duration (w.r.t. vendor_id)
+
+Do quieter days and hours lead to faster trips? Here we include the vendor_id as an additional feature. Furthermore, for the hours of the day we add a smoothing layer to indicate the extent of the variation and its uncertainties:
+
+```{r}
+p1 <- train %>%
+  mutate(wday = factor(wday(pickup_datetime, label = TRUE))) %>%
+  group_by(wday, vendor_id) %>%
+  dplyr::summarise(median_duration = median(trip_duration)/60) %>%
+  ggplot() +
+    aes(x=wday, y=median_duration, color = as.factor(vendor_id)) +
+    geom_smooth(method = "loess", span = 1/2) +
+    geom_point(size = 4) +
+    scale_color_hue() +
+    labs(x = "Day of the week", y = "Median trip duration [min]")
+plot(p1)
+```
+
+```{r}
+p2 <- train %>%
+  mutate(hpick = hour(pickup_datetime)) %>%
+  dplyr::group_by(hpick, vendor_id) %>%
+  dplyr::summarise(median_duration = median(trip_duration)/60) %>%
+  ggplot()+
+    aes(x= hpick, y=median_duration, color = as.factor(vendor_id)) +
+    geom_smooth(method = "loess", span = 1/2) +
+    geom_point(size = 4) +
+    #geom_text(show.legend = FALSE)+
+    scale_color_hue() +
+    labs(x = "Hour of the day", y = "Median trip duration [min]") 
+    #theme(legend.position = "none")
+plot(p2)
+```
+
+The two figures represent how the day and the week affect the average trip duration (Here we include the vendor_id as an additional feature.). 
+We can find a peak in the early afternoon and dips around 5-6am and 8pm. 
+The Vendor 2, the one with the more frequent trips, also has consistently higher trip durations than vendor 1. 
+
+**Conclusion :**
+The **vendor_id, the weekday and hour of a trip** appear to be important features for predicting its duration and should be included in the model.
+
+### Passenger count and Trip Duration (w.r.t. vendor_id)
+
+```{r}
+train %>%
+  ggplot() +
+  aes(passenger_count, trip_duration, color = passenger_count) +
+  geom_boxplot() +
+  scale_y_log10() +
+  theme(legend.position = "none") +
+  facet_wrap(~ vendor_id) +
+  labs(y = "Trip duration [s]", x = "Number of passengers")
+```
+
+The figure represent how the number of passengers affect the duration of the trip. (Here we include the vendor_id as an additional feature).
+We finf that
+* Both vendors have short trips without any passengers.
+* Vendor 1 has all of the trips beyond 24 hours, whereas vendor 2 has all of the (five) trips with more than six passengers and many more trips that approach the 24-hour limit.
+* Between 1 and 6 passengers the median trip durations are remarkably similar, in particular for vendor 2.
+
+```{r}
+train %>%
+  ggplot(aes(trip_duration, fill = vendor_id)) +
+  geom_density(position = "stack") +
+  scale_x_log10()
+```
+
+Comparing the densities of the trip_duration distribution for the two vendors we find that the medians are very similar, whereas the means are likely skewed by vendor 2 containing most of the long-duration outliers:
+```{r}
+train %>%
+  group_by(vendor_id) %>%
+  summarise(mean_duration = mean(trip_duration),
+            median_duration = median(trip_duration))
+```
+
 # External data
 
 ## Weather factors
@@ -729,7 +789,7 @@ From the first histogram, we can see that the vendor 2 has the most success in g
 In order to improve our model, we have decided to introduce some external data, such as the weather.
 
 ```{r variable_weather}
-weather <- read.csv(file = "weather_data_nyc_centralpark_2016(1).csv")
+weather <- read.csv(file = "nyc-taxi-trip-duration/weather_data_nyc_centralpark_2016(1).csv")
 summary(weather)
 glimpse(weather)
 ```
@@ -746,21 +806,26 @@ This data is contains 7 variables, which are :
 
 Now we'll transform our data. We turn the date into a lubridate object and convert the traces (“T”) of rain and snow into small numeric amounts. We also save the maximum and minimum temperature in a shorter form :  
 
-```{r}
+```{r warning=FALSE}
+weather$precipitation <- as.numeric(as.vector(weather$precipitation))
+weather$snow.fall <-as.numeric(as.vector(weather$snow.fall))
+weather$snow.depth <- as.numeric(as.vector(weather$snow.depth))
+ 
+
 weather <- weather %>%
   mutate(date = dmy(date),
-         precipitation = as.numeric(ifelse(precipitation == "T", "0.01", precipitation)),
-         snow.fall = as.numeric(ifelse(snow.fall == "T", "0.01", snow.fall)),
-         snow.depth = as.numeric(ifelse(snow.depth == "T", "0.01", snow.depth)),
+         precipitation = as.numeric(ifelse(is.na(precipitation), "0.001", precipitation)),
+         snow.fall = as.numeric(ifelse(is.na(snow.fall), "0.01", snow.fall)),
+         snow.depth = as.numeric(ifelse(is.na(snow.depth), "0.01", snow.depth)),
          all_precip = snow.fall + precipitation,
          has_snow = (snow.fall > 0.01) | (snow.depth > 0.01),
          has_rain = precipitation > 0.01)
 ```
 
-Now we can join this to our train data :   
+And we joined this to our train data :
 
-```{r}
-plus <- weather[,which(colnames(weather)%in%c("date", "precipitation", "snow.fall", "snow.depth", "all_precip", "has_snow", "has_rain", "maximum.temperature", "minimum.temperature", "average.temperature"))]
+```{r execute_q'une_seule_fois}
+plus <- weather
 
 dateTrain <- as.Date(format(as.POSIXct(train$pickup_datetime), "%Y-%m-%d"))
 dateTrain <- ymd(dateTrain)
@@ -777,21 +842,20 @@ p1 <- train %>%
   dplyr::count() %>%
   ggplot(aes(dateWeather,n/1e3)) +
   geom_line(size = 1.5, color = "red") +
-  labs(x = "", y = "Kilo trips per day")
-plot(p1)
+  labs(x = "", y = "Kilo trips per day") +
+  scale_x_date(breaks = "1 month") 
+
 
 p2 <- train %>%
   group_by(dateWeather) %>%
   dplyr::summarise(trips = n(),
             s.fall = mean(snow.fall),
-            r.fall = mean(precipitation),
-            all.precip = mean(all_precip)) %>%
+            r.fall = mean(precipitation)) %>%
   ggplot(aes(dateWeather, s.fall)) +
   geom_line(color = "blue", size = 1.5) +
   labs(x = "", y = "Snowfall") +
   scale_y_sqrt() +
-  scale_x_date(limits = ymd(c("2015-12-28", "2016-06-30")))
-plot(p2)
+  scale_x_date(limits = ymd(c("2015-12-28", "2016-06-30")), breaks = "1 month")
 
 p3 <- train %>%
   group_by(dateWeather) %>%
@@ -801,19 +865,20 @@ p3 <- train %>%
   geom_line(color = "purple", size = 1.5) +
   labs(x = "", y = "Snow depth") +
   scale_y_sqrt() +
-  scale_x_date(limits = ymd(c("2015-12-29", "2016-06-30")))
-plot(p3)
+  scale_x_date(limits = ymd(c("2015-12-29", "2016-06-30")), breaks = "1 month")
+
 
 p4 <- train %>%
   group_by(dateWeather) %>%
   dplyr::summarise(median_speed = median(avgSpeed)) %>%
   ggplot(aes(dateWeather, median_speed)) +
   geom_line(color = "orange", size = 1.5) +
-  labs(x = "Date", y = "Median speed")
-plot(p4)
+  labs(x = "Date", y = "Median speed") +
+  scale_x_date(breaks = "1 month") 
 
-#layout <- matrix(c(1,2,3,4),4,1,byrow=FALSE)
-#multiplot(p1, p2, p3, p4, layout=layout)
+
+layout <- matrix(c(1,2,3,4),4,1,byrow=FALSE)
+multiplot(p1, p2, p3, p4, layout=layout)
 ```
 
 From the first plot, it appears that there is a drastic drop in the number of trips at the end of January / the beginning for February, which we were not able to explain before. Now, we can confirm that the weather conditions do have an big impact on the trips' frequency. Indeed, on that period, we can see that there are pics of snow falls, and that the snow's depth is actually higher. Also, on the few trips that have occured, the average speed was much lower than usual. However, this being the biggest snow fall that New York had experienced that year, the other ones didn't have that much of an effect on the trafic. 
@@ -852,25 +917,131 @@ multiplot(p1, p2, layout=layout)
 
 Clearly, there isn't much difference between the impact of snowfall and rainfall on the average speed, so we do not have much information here. 
 Nonetheless, we shall add the weather features to our model as it may improve our results. 
+
+## Airport distance
+In our maps (above) and trip paths (below) we noticed that a number of trips began or ended at either of the two NYC airports: JFK and La Guardia. Since airports are usually not in the city centre it is reasonable to assume that the pickup/dropoff distance from the airport could be a useful predictor for longer trip_durations. Above, we defined the coordinates of the two airports and compute the corresponding distances.
+
+```{r}
+jfk_coord <- tibble(lon = -73.778889, lat = 40.639722)
+la_guardia_coord <- tibble(lon = -73.872611, lat = 40.77725)
+
+pick_coord <- train %>%
+  dplyr::select(pickup_longitude, pickup_latitude)
+drop_coord <- train %>%
+  dplyr::select(dropoff_longitude, dropoff_latitude)
+
+
+train$jfk_dist_pick <- distCosine(pick_coord, jfk_coord)
+train$jfk_dist_drop <- distCosine(drop_coord, jfk_coord)
+train$lg_dist_pick <- distCosine(pick_coord, la_guardia_coord)
+train$lg_dist_drop <- distCosine(drop_coord, la_guardia_coord)
+```
+
+
+```{r}
+p1 <- train %>%
+  ggplot(aes(jfk_dist_pick)) +
+  geom_histogram(bins = 30, fill = "red") +
+  scale_x_log10() +
+  scale_y_sqrt() +
+  geom_vline(xintercept = 2e3) +
+  labs(x = "JFK pickup distance")
+
+p2 <- train %>%
+  ggplot(aes(jfk_dist_drop)) +
+  geom_histogram(bins = 30, fill = "blue") +
+  scale_x_log10() +
+  scale_y_sqrt() +
+  geom_vline(xintercept = 2e3) +
+  labs(x = "JFK dropoff distance")
+
+p3 <- train %>%
+  ggplot(aes(lg_dist_pick)) +
+  geom_histogram(bins = 30, fill = "red") +
+  scale_x_log10() +
+  scale_y_sqrt() +
+  geom_vline(xintercept = 2e3) +
+  labs(x = "La Guardia pickup distance")
+
+p4 <- train %>%
+  ggplot(aes(lg_dist_drop)) +
+  geom_histogram(bins = 30, fill = "blue") +
+  scale_x_log10() +
+  scale_y_sqrt() +
+  geom_vline(xintercept = 2e3) +
+  labs(x = "La Guardia dropoff distance")
+
+layout <- matrix(c(1,2,3,4),2,2,byrow=FALSE)
+multiplot(p1, p2, p3, p4, layout=layout)
+```
+
+Based on these numbers, we can define a JFK/La Guardia trip as having a pickup or dropoff distance of less than 2 km from the corresponding airport.
+
+What are the trip_durations of these journeys?
+```{r}
+train <- train %>%
+  mutate(jfk_trip = (jfk_dist_pick < 2e3) | (jfk_dist_drop < 2e3),
+         lg_trip = (lg_dist_pick < 2e3) | (lg_dist_drop < 2e3))
+
+p1 <- train %>%
+  filter(trip_duration < 23*3600) %>%
+  ggplot(aes(jfk_trip, trip_duration, color = jfk_trip)) +
+  geom_boxplot() +
+  scale_y_log10() +
+  theme(legend.position = "none") +
+  labs(x = "JFK trip")
+
+p2 <- train %>%
+  filter(trip_duration < 23*3600) %>%
+  ggplot(aes(lg_trip, trip_duration, color = lg_trip)) +
+  geom_boxplot() +
+  scale_y_log10() +
+  theme(legend.position = "none") +
+  labs(x = "La Guardia trip")
+
+layout <- matrix(c(1,2),1,2,byrow=FALSE)
+multiplot(p1, p2, layout=layout)
+```
+
+We find that our hypothesis was correct and that trips to the airport, in particular the more distant JFK, have significantly longer average trip_durations. **These two features should definitely be part of our model.**
  
 # Construction of Model 
+
+After all the before analysis, we have well explored the context and extracted as much information we could, we then need to make a selection of all our features available.
 
 ## Selection of Features
 
 ```{r}
 # Train features
-dat <- train[,-which(colnames(train)%in%c("id","pickup_datetime","dropoff_datetime", "pickup_longitude", "pickup_latitude", "dropoff_longitude", "dropoff_latitude","avgSpeed","trip_duration","direction", "distance", "minimum.temperature", "maximum.temperature", "dateWeather", "dropoff_hour", "dropoff_month", "dropoff_wday", "average.temperature", "all_precip"))]
+dat <- train[,-which(colnames(train)%in%c("id","pickup_datetime","dropoff_datetime", "pickup_longitude", "pickup_latitude", "dropoff_longitude", "dropoff_latitude","avgSpeed","trip_duration","direction", "distance", "minimum.temperature", "maximum.temperature", "dateWeather", "dropoff_hour", "dropoff_month", "dropoff_wday", "average.temperature", "all_precip", "has_snow", "has_rain", "precipitation"))]
 
 dat$trip_duration <- train$trip_duration
 dat$distance <- train$distance
 ```
 
-```{r}
+```{r ajoute_par_zy_dummy_vars_and_log}
+for (i in which(colnames(dat)%in%c("vendor_id","store_and_fwd_flag","pickup_hour","pickup_month","pickup_wday","pickupCluster","dropoffCluster"))) {
+  dat[,i] <- as.factor(dat[,i])
+}
+
+dat$jfk_trip <- ifelse((dat$jfk_trip*dat$jfk_dist_pick)!=0,log(dat$jfk_trip*dat$jfk_dist_pick),0)
+dat$lg_trip <- ifelse((dat$lg_trip*dat$lg_dist_pick)!=0,log(dat$lg_trip*dat$lg_dist_pick),0)
+dat <- dat[,-which(colnames(dat)%in%c("jfk_dist_pick","jfk_dist_drop","lg_dist_pick","lg_dist_drop"))]
+
+dat$distance <- log( train$distance)
+dat$trip_duration <- log(train$trip_duration)
+temp <- dat$trip_duration
+dat <- dat[,-which(colnames(dat)%in%c("trip_duration"))]
+dat <- data.frame(dat, trip_duration = temp)
+```
+
+
+```{r test}
 test$pickup_hour <-  hour(test$pickup_datetime)
 test$pickup_month <-  month(test$pickup_datetime)
 test$pickup_wday <-  wday(test$pickup_datetime)
 
-plus <- weather[,which(colnames(weather)%in%c("date", "precipitation", "snow.fall", "snow.depth", "all_precip", "has_snow", "has_rain", "maximum.temperature", "minimum.temperature", "average.temperature"))]
+plus <- weather[,which(colnames(weather)%in%c("date","snow.fall", "snow.depth"))]
 
 dateTest <- as.Date(format(as.POSIXct(test$pickup_datetime), "%Y-%m-%d"))
 dateTest <- ymd(dateTest)
@@ -878,9 +1049,32 @@ dateTest <- ymd(dateTest)
 test$dateWeather <- dateTest
 test <- left_join(test, plus, by = c("dateWeather" = "date"))
 
-testDat <- test[,-which(colnames(test)%in%c("id", "pickup_datetime", "dropoff_datetime", "pickup_longitude", "pickup_latitude", "dropoff_longitude", "dropoff_latitude", "distance", "direction", "dateWeather", "maximum.temperature", "minimum.temperature", "average.temperature", "all_precip"))]
-testDat$distance <- test$distance
-testDat <- testDat[,c(1, 2, 3, 6, 7, 8, 4, 5, 9, 10, 11, 12, 13, 14)] # Garder le même ordre de colonnes que dans dat
+### airport variables
+pick_coord <- test %>%
+  dplyr::select(pickup_longitude, pickup_latitude)
+drop_coord <- test %>%
+  dplyr::select(dropoff_longitude, dropoff_latitude)
+
+test$jfk_dist_pick <- distCosine(pick_coord, jfk_coord)
+test$jfk_dist_drop <- distCosine(drop_coord, jfk_coord)
+test$lg_dist_pick <- distCosine(pick_coord, la_guardia_coord)
+test$lg_dist_drop <- distCosine(drop_coord, la_guardia_coord)
+test <- test %>%
+  mutate(jfk_trip = (jfk_dist_pick < 2e3) | (jfk_dist_drop < 2e3),
+         lg_trip = (lg_dist_pick < 2e3) | (lg_dist_drop < 2e3))
+
+test$jfk_trip <- ifelse((test$jfk_trip*test$jfk_dist_pick)!=0,log(test$jfk_trip*test$jfk_dist_pick),0)
+test$lg_trip <- ifelse((test$lg_trip*test$lg_dist_pick)!=0,log(test$lg_trip*test$lg_dist_pick),0)
+
+testDat <- test[,which(colnames(test)%in%colnames(dat))]
+testDat$distance <- log(test$distance)
+
+# Garder le même ordre de colonnes que dans dat
+testDat <- testDat[,c(1,2,3,7,8,9,5,6,10,11,12,13,4)]
+# as.factor
+for (i in which(colnames(testDat)%in%c("vendor_id","store_and_fwd_flag","pickup_hour","pickup_month","pickup_wday","pickupCluster","dropoffCluster"))) {
+  testDat[,i] <- as.factor(testDat[,i])
+}
 ```
 
 In order to build the regression models, we have selected some important features given the previous analysis : vendor_id, passenger_count, store_and_fwd_flag, pickup_hour, pickup_month, pickup_wday, pickupCluster, dropoffCluster, distance, and trip_duration, has_rain, has_snow, precipitation, snow.depth, snow.fall.
@@ -902,20 +1096,22 @@ We can see that there is a strong positive correlation between the duration and 
 
 To build our best model, we have tried using different regression models. The different results are below : 
 
+```{r ajoute_par_zy_si_enleve_cluster}
+dat <- dat[,-which(colnames(dat)%in%c("pickupCluster","dropoffCluster"))]
+testDat <- testDat[,-which(colnames(testDat)%in%c("pickupCluster","dropoffCluster"))]
+```
+
+
 ```{r Simple Linear Regression}
 regmod <- lm(formula = trip_duration ~., data = dat)
 summary(regmod)
 
 par(mfrow=c(2,2))
 plot(regmod)
+```
 
-testDatReg <- testDat
-testDatReg$has_rain <- as.numeric(as.factor(testDatReg$has_rain))
-testDatReg$has_snow <- as.numeric(as.factor(testDatReg$has_snow))
-
-testDatReg <- cbind(rep(1, nrow(testDat)), testDat)
-Y_testreg = data.matrix(testDatReg)%*%regmod$coefficients
-
+```{r}
+Y_testreg <- exp(predict(object = regmod, newdata = testDat))
 sample_submission_data<-read.csv(file="nyc-taxi-trip-duration/sample_submission.csv",sep=",",header=TRUE)
 sample_submission_data$trip_duration <- Y_testreg
 write.csv(x = sample_submission_data, file = "submitreg.csv",row.names = FALSE)
